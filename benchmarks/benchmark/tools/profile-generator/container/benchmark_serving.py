@@ -137,7 +137,9 @@ def init_errors_map() -> Dict[str, int]:
 
 async def send_stream_request(
     backend: str,
+    base_model: str,
     api_url: str,
+    metrics_url: str,
     prompt: str,
     prompt_len: int,
     output_len: int,
@@ -198,6 +200,16 @@ async def send_stream_request(
           elif backend == "jetstream":
             if chunk_bytes.decode("utf-8") != "":
               output += json.loads(chunk_bytes.decode("utf-8"))["text"]
+        
+      async with session.get(metrics_url, headers={}, ssl=False) as metrics_response:
+                if metrics_response.status == 200:
+                    metrics_data = await metrics_response.text()
+                    for line in metrics_data.splitlines():
+                        if f'vllm:gpu_cache_usage_perc{{model_name="{base_model}"}}' in line:
+                            gpu_cache_usage_perc = float(line.split()[-1])
+                        if f'vllm:num_requests_waiting{{model_name="{base_model}"}}' in line:
+                            num_requests_waiting = float(line.split()[-1])
+                            
     except aiohttp.client_exceptions.ClientConnectorError as client_err:
       errors["ClientConnectorError"] += 1
       print(f"ClientConnectorError: {client_err}")
@@ -225,7 +237,7 @@ async def send_stream_request(
   request_end_time = time.time()
   output_token_ids = tokenizer(output).input_ids
   output_len = len(output_token_ids)
-  request_latency = (prompt_len, output_len, (request_end_time - request_start_time))
+  request_latency = (prompt_len, output_len, (request_end_time - request_start_time), gpu_cache_usage_perc, num_requests_waiting)
 
   # Exclude first token for tpot calculation
   if output_len > 1:
@@ -239,7 +251,9 @@ async def send_stream_request(
 
 async def send_request(
     backend: str,
+    base_model: str,
     api_url: str,
+    metrics_url: str,
     prompt: str,
     prompt_len: int,
     output_len: int,
@@ -329,6 +343,14 @@ async def send_request(
       try:
         async with session.post(api_url, headers=headers, json=pload, ssl=False) as response:
           output = await response.json()
+        async with session.get(metrics_url, headers={}, ssl=False) as metrics_response:
+                if metrics_response.status == 200:
+                    metrics_data = await metrics_response.text()
+                    for line in metrics_data.splitlines():
+                        if f'vllm:gpu_cache_usage_perc{{model_name="{base_model}"}}' in line:
+                            gpu_cache_usage_perc = float(line.split()[-1])
+                        if f'vllm:num_requests_waiting{{model_name="{base_model}"}}' in line:
+                            num_requests_waiting = float(line.split()[-1])
 
         # Re-send the request if it failed.
         if "error" not in output:
@@ -385,16 +407,32 @@ async def send_request(
     output_len = len(output_token_ids)
 
   # (prompt len, output len, latency, success)
-  request_latency = (prompt_len, output_len, (request_end_time - request_start_time))
+  request_latency = (prompt_len, output_len, (request_end_time - request_start_time), gpu_cache_usage_perc, num_requests_waiting)
   request_latency_per_output_token_metric.observe((request_end_time - request_start_time) / output_len)
   prompt_length_metric.observe(prompt_len)
   response_length_metric.observe(output_len)
 
   return request_latency, None, None
 
+
+def convert_numpy_values(obj):
+    """Convert numpy values to Python native types for JSON serialization."""
+    if isinstance(obj, dict):
+        return {key: convert_numpy_values(value) for key, value in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_numpy_values(x) for x in obj]
+    elif isinstance(obj, (np.int64, np.int32, np.int16, np.int8)):
+        return int(obj)
+    elif isinstance(obj, (np.float64, np.float32, np.float16)):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return convert_numpy_values(obj.tolist())
+    return obj
+
 async def benchmark(
     args: argparse.Namespace, 
     api_url: str,
+    metrics_url: str,
     tokenizer: PreTrainedTokenizerBase,
     model: str,
 ) -> Tuple[List[Tuple[int, int, float]], List[float], Dict[str, int]]:
@@ -417,7 +455,9 @@ async def benchmark(
       task = asyncio.create_task(
         send_stream_request(
             args.backend,
+            args.base_model,
             api_url,
+            metrics_url,
             prompt,
             prompt_len,
             output_len,
@@ -434,7 +474,9 @@ async def benchmark(
       task = asyncio.create_task(
       send_request(
           args.backend,
+          args.base_model,
           api_url,
+          metrics_url,
           prompt,
           prompt_len,
           output_len,
@@ -567,19 +609,7 @@ def metrics_to_scrape(backend: str) -> List[str]:
   # It must be populated on the outputs 'metrics' field as 'key':'stats'
   # If a value is specified for a given key, it will be populated on the outputs `summary_stats.stats` field as 'value':'stats' as well.
   if backend == "vllm":
-    return [
-      "vllm:gpu_cache_usage_perc", 
-      "vllm:num_requests_waiting",
-      "vllm:num_requests_running",
-      "vllm:num_requests_swapped",
-      "vllm:time_to_first_token_seconds",
-      "vllm:time_per_output_token_seconds",
-      "vllm:request_queue_time_seconds",
-      "vllm:request_inference_time_seconds",
-      "vllm:request_prompt_tokens",
-      "vllm:request_generation_tokens",
-      "vllm:iteration_tokens_total",
-    ]
+    return ["vllm:gpu_cache_usage_perc", "vllm:num_requests_waiting"]
   elif backend == "jetstream":
     return [
       "jetstream_slots_used_percentage",
@@ -697,9 +727,11 @@ def print_and_save_result(args: argparse.Namespace, benchmark_duration, total_re
   benchmark_result["num_prompts_succeeded"] = len(request_latencies)
   benchmark_result['benchmark_time'] = benchmark_duration
   benchmark_result['throughput_rps'] = (args.num_prompts / benchmark_duration)
+  
+  request_latencies_updated = [(p, o, l, q, gpu, ttft) for (p, o, l, gpu, q), ttft in zip(request_latencies, ttfts)]
 
-  total_output_tokens = np.sum([output_len for _, output_len, _ in
-                                request_latencies])
+  total_output_tokens = np.sum([output_len for _, output_len, _, _, _, _ in
+                                request_latencies_updated])
   output_tokens_per_second = total_output_tokens / benchmark_duration
   benchmark_result['throughput'] = output_tokens_per_second
 
@@ -708,8 +740,8 @@ def print_and_save_result(args: argparse.Namespace, benchmark_duration, total_re
   benchmark_result['total_output_token'] = int(total_output_tokens)
   benchmark_result['output_tokens_per_min'] = output_tokens_per_min
 
-  total_input_tokens = np.sum([prompt_len for prompt_len, _, _ in
-                               request_latencies])
+  total_input_tokens = np.sum([prompt_len for prompt_len, _, _, _, _, _ in
+                               request_latencies_updated])
   input_tokens_per_min = 60 * total_input_tokens / benchmark_duration
   print(f"Input_tokens/min: {input_tokens_per_min:.2f}")
   benchmark_result['total_input_tokens'] = int(total_input_tokens)
@@ -733,15 +765,22 @@ def print_and_save_result(args: argparse.Namespace, benchmark_duration, total_re
     **benchmark_result,
     **(get_stats_for_set("per_token_latency", "seconds/token (includes waiting time on server)", [
       latency / (prompt_len + output_len)
-      for prompt_len, output_len, latency in request_latencies
+      for prompt_len, output_len, latency, _, _, _ in request_latencies_updated
     ])),
     **ttft_stats,
     # NOTE: The latency below includes requests awaiting time on server side.
     # It's not comparable with the model inference latency for batch size 1.
-    **(get_stats_for_set("latency", "milliseconds/request (includes waiting time on server)" ,[1000 * latency for _, _, latency in request_latencies])),
-    **(get_stats_for_set("per_output_token_latency", "milliseconds/output_token (includes waiting time on server)", [1000 * latency / output_len for _, output_len, latency in request_latencies])),
-    **(get_stats_for_set("input_len", "input length", [float(prompt_len) for prompt_len, _, _ in request_latencies])),
-    **(get_stats_for_set("output_len", "output length", [float(output_len) for _, output_len, _ in request_latencies]))
+    **(get_stats_for_set("latency", "milliseconds/request (includes waiting time on server)" ,[1000 * latency for _, _, latency, _, _, _ in request_latencies_updated])),
+    **(get_stats_for_set("per_output_token_latency", "milliseconds/output_token (includes waiting time on server)", [1000 * latency / output_len for _, output_len, latency, _, _, _ in request_latencies_updated])),
+    **(get_stats_for_set("input_len", "input length", [float(prompt_len) for prompt_len, _, _, _, _, _ in request_latencies_updated])),
+    **(get_stats_for_set("output_len", "output length", [float(output_len) for _, output_len, _, _, _, _ in request_latencies_updated])), 
+    **(get_stats_for_set("gpu", "gpu", 
+            [float(gpu) for prompt_len, output_len, latency, q, gpu, ttft in request_latencies_updated])),
+    **(get_stats_for_set("waiting_queue_size", "waiting queue size", 
+            [float(q) for prompt_len, output_len, latency, q, gpu, ttft in request_latencies_updated])),
+    **(get_stats_for_set("tpot", "TPOT", 
+            [1000 * float((latency-ttft)/(output_len-1)) if args.stream_request else 1000 * (latency) / (output_len)   for prompt_len, output_len, latency, q, gpu, ttft in request_latencies_updated])),
+        
   }
 
   server_metrics = {}
@@ -779,6 +818,7 @@ async def main(args: argparse.Namespace):
   start_http_server(PROMETHEUS_PORT)
 
   api_url = f"http://{args.host}:{args.port}/{endpoint}"
+  metric_url = f"http://{args.host}:{args.port}/metrics"
   tokenizer = AutoTokenizer.from_pretrained(
       args.tokenizer, trust_remote_code=args.trust_remote_code
   )
@@ -787,7 +827,7 @@ async def main(args: argparse.Namespace):
   args.start_datetime = datetime.fromtimestamp(benchmark_start_time)
   
   results = await asyncio.gather(
-            *[benchmark(args, api_url, tokenizer, model) for model in models]
+            *[benchmark(args, api_url, metric_url, tokenizer, model) for model in models]
         )
   
   # Summarize results
@@ -843,6 +883,12 @@ if __name__ == "__main__":
     "--models",
     type=str,
     help="Comma separated list of models to benchmark.",
+  )
+  parser.add_argument(
+    "--base-model",
+    type=str,
+    help="Base LLM",
+    default = "meta-llama/Llama-2-7b-hf"
   )
   parser.add_argument(
     "--stream-request", 
