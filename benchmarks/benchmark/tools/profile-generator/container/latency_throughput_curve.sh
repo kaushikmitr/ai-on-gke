@@ -16,6 +16,7 @@
 set -o xtrace
 
 export IP=$IP
+export VLLM_USE_V1="1"
 
 huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential
 
@@ -37,7 +38,7 @@ for request_rate in $(echo $REQUEST_RATES | tr ',' ' '); do
     num_prompts=$(awk "BEGIN {print int($request_rate * $BENCHMARK_TIME_SECONDS)}")
   fi
   echo "TOTAL prompts: $num_prompts"  # Output: 8
-  PYTHON_OPTS="$PYTHON_OPTS --save-json-results --host=$IP  --port=$PORT --dataset=$PROMPT_DATASET_FILE --tokenizer=$TOKENIZER --request-rate=$request_rate --backend=$BACKEND --num-prompts=$num_prompts --max-input-length=$INPUT_LENGTH --max-output-length=$OUTPUT_LENGTH --file-prefix=$FILE_PREFIX --models=$MODELS"
+  PYTHON_OPTS="$PYTHON_OPTS --save-json-results --host=$IP  --port=$PORT --dataset=$PROMPT_DATASET_FILE --tokenizer=$TOKENIZER --request-rate=$request_rate --backend=$BACKEND --num-prompts=$num_prompts --min-input-length=$MIN_INPUT_LENGTH --min-output-length=$MIN_OUTPUT_LENGTH --max-input-length=$INPUT_LENGTH --max-output-length=$OUTPUT_LENGTH --file-prefix=$FILE_PREFIX --models=$MODELS"
   if [[ "$OUTPUT_BUCKET" ]]; then
     PYTHON_OPTS="$PYTHON_OPTS --output-bucket=$OUTPUT_BUCKET"
   fi

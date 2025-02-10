@@ -53,10 +53,13 @@ trace_config.on_request_end.append(on_request_end)
 gcs_client = None
 gcs_bucket = None
 
+
 def get_filtered_dataset(
     dataset_path: str,
     max_input_len: int,
     max_output_len: int,
+    min_input_len: int,
+    min_output_len: int,
     tokenizer: PreTrainedTokenizerBase,
     use_dummy_text: bool,
 ) -> List[Tuple[str, int, int]]:
@@ -95,7 +98,7 @@ def get_filtered_dataset(
   filtered_dataset: List[Tuple[str, int, int]] = []
   for prompt, prompt_token_ids, output_len in tokenized_dataset:
     prompt_len = len(prompt_token_ids)
-    if prompt_len < MIN_SEQ_LEN or output_len < MIN_SEQ_LEN:
+    if prompt_len < min_input_len or output_len < min_output_len:
       # Prune too short sequences.
       # This is because TGI causes errors when the input or output length
       # is too short.
@@ -411,6 +414,8 @@ async def send_request(
   request_latency_per_output_token_metric.observe((request_end_time - request_start_time) / output_len)
   prompt_length_metric.observe(prompt_len)
   response_length_metric.observe(output_len)
+  
+
 
   return request_latency, None, None
 
@@ -441,12 +446,15 @@ async def benchmark(
       args.dataset,
       args.max_input_length,
       args.max_output_length,
+      args.min_input_length,
+      args.min_output_length,
       tokenizer,
       args.use_dummy_text,
   )
   benchmark_start_time = time.time()
   tasks: List[asyncio.Task] = []
   prompts_sent: int = 0
+  base_model = args.tokenizer if args.base_model is None else args.base_model
   async for request in generate_next_request(input_requests, args.request_rate):
     if args.num_prompts <= prompts_sent:
       break
@@ -455,7 +463,7 @@ async def benchmark(
       task = asyncio.create_task(
         send_stream_request(
             args.backend,
-            args.base_model,
+            base_model,
             api_url,
             metrics_url,
             prompt,
@@ -474,7 +482,7 @@ async def benchmark(
       task = asyncio.create_task(
       send_request(
           args.backend,
-          args.base_model,
+          base_model,
           api_url,
           metrics_url,
           prompt,
@@ -593,7 +601,7 @@ def save_json_results(args: argparse.Namespace, benchmark_result, server_metrics
   # Save to file
   model_without_slash = model.replace("/","-")
   file_name = (
-      f"{args.file_prefix}-{args.backend}-{args.request_rate}qps-{args.start_datetime.strftime('%Y%m%d-%H%M%S')}-{model_without_slash}.json"
+      f"{args.file_prefix}-{args.backend}-{args.request_rate}-{args.num_prompts}qps-{args.start_datetime.strftime('%Y%m%d-%H%M%S')}-{model_without_slash}.json"
   )
   with open(file_name, "w", encoding="utf-8") as outfile:
     json.dump(final_json, outfile)
@@ -728,8 +736,10 @@ def print_and_save_result(args: argparse.Namespace, benchmark_duration, total_re
   benchmark_result['benchmark_time'] = benchmark_duration
   benchmark_result['throughput_rps'] = (args.num_prompts / benchmark_duration)
   
-  request_latencies_updated = [(p, o, l, q, gpu, ttft) for (p, o, l, gpu, q), ttft in zip(request_latencies, ttfts)]
-
+  request_latencies_updated = [
+    (p, o, l, q, gpu, ttft if ttfts else 0)  # Default to 0 if ttfts is empty
+    for (p, o, l, gpu, q), ttft in zip(request_latencies, ttfts or [0] * len(request_latencies))
+]
   total_output_tokens = np.sum([output_len for _, output_len, _, _, _, _ in
                                 request_latencies_updated])
   output_tokens_per_second = total_output_tokens / benchmark_duration
@@ -888,7 +898,6 @@ if __name__ == "__main__":
     "--base-model",
     type=str,
     help="Base LLM",
-    default = "meta-llama/Llama-2-7b-hf"
   )
   parser.add_argument(
     "--stream-request", 
@@ -934,6 +943,22 @@ if __name__ == "__main__":
       default=1024,
       help=(
           "Maximum number of input tokens for filtering the benchmark dataset."
+      ),
+  )
+  parser.add_argument(
+      "--min-input-length",
+      type=int,
+      default=4,
+      help=(
+          "Maximum number of output tokens for filtering the benchmark dataset."
+      ),
+  )
+  parser.add_argument(
+      "--min-output-length",
+      type=int,
+      default=4,
+      help=(
+          "Minimum number of output tokens for filtering the benchmark dataset."
       ),
   )
   parser.add_argument(
