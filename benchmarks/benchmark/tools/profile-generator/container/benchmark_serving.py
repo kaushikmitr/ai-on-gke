@@ -441,80 +441,149 @@ async def benchmark(
     tokenizer: PreTrainedTokenizerBase,
     model: str,
 ) -> Tuple[List[Tuple[int, int, float]], List[float], Dict[str, int]]:
-  """Runs benchmark with asynchronous requests."""
-  input_requests = get_filtered_dataset(
-      args.dataset,
-      args.max_input_length,
-      args.max_output_length,
-      args.min_input_length,
-      args.min_output_length,
-      tokenizer,
-      args.use_dummy_text,
-  )
-  benchmark_start_time = time.time()
-  tasks: List[asyncio.Task] = []
-  prompts_sent: int = 0
-  base_model = args.tokenizer if args.base_model is None else args.base_model
-  async for request in generate_next_request(input_requests, args.request_rate):
-    if args.num_prompts <= prompts_sent:
-      break
-    prompt, prompt_len, output_len = request
-    if args.stream_request:
-      task = asyncio.create_task(
-        send_stream_request(
-            args.backend,
-            base_model,
-            api_url,
-            metrics_url,
-            prompt,
-            prompt_len,
-            output_len,
-            args.best_of,
-            args.use_beam_search,
-            args.top_k,
-            tokenizer,
-            args.sax_model,
-            model,
-            args.request_timeout,
-        )
-      )
-    else: 
-      task = asyncio.create_task(
-      send_request(
-          args.backend,
-          base_model,
-          api_url,
-          metrics_url,
-          prompt,
-          prompt_len,
-          output_len,
-          args.best_of,
-          args.use_beam_search,
-          args.top_k,
-          tokenizer,
-          args.sax_model,
-          model,
-          args.request_timeout,
-        )
-      )
-    tasks.append(task)
-    prompts_sent += 1
-  results = await asyncio.gather(*tasks)
-  combined_latencies = []
-  combined_ttfts = []
-  combined_errors = init_errors_map()
-  for latency, ttft, errors in results:
-    if latency:
-      combined_latencies.append(latency)
-    if errors:
-      for err, count in errors.items():
-        combined_errors[err] = combined_errors[err] + count
-    if ttft:
-      combined_ttfts.append(ttft)
-  
-  benchmark_duration = time.time() - benchmark_start_time
-  print_and_save_result(args, benchmark_duration, prompts_sent, model, combined_latencies, combined_ttfts, combined_errors)
-  return combined_latencies, combined_ttfts, combined_errors
+    """Runs benchmark with asynchronous requests, including a warm-up and a timed benchmark phase."""
+    input_requests = get_filtered_dataset(
+        args.dataset,
+        args.max_input_length,
+        args.max_output_length,
+        args.min_input_length,
+        args.min_output_length,
+        tokenizer,
+        args.use_dummy_text,
+    )
+
+    base_model = args.tokenizer if args.base_model is None else args.base_model
+
+    # Warm-up Phase: send prompts for 10 seconds without collecting results.
+    warm_up_period = args.warmup_duration
+    warm_up_start = time.time()
+    async for request in generate_next_request(input_requests, args.request_rate):
+        if time.time() - warm_up_start >= warm_up_period:
+            break
+        prompt, prompt_len, output_len = request
+        if args.stream_request:
+            asyncio.create_task(
+                send_stream_request(
+                    args.backend,
+                    base_model,
+                    api_url,
+                    metrics_url,
+                    prompt,
+                    prompt_len,
+                    output_len,
+                    args.best_of,
+                    args.use_beam_search,
+                    args.top_k,
+                    tokenizer,
+                    args.sax_model,
+                    model,
+                    args.request_timeout,
+                )
+            )
+        else:
+            asyncio.create_task(
+                send_request(
+                    args.backend,
+                    base_model,
+                    api_url,
+                    metrics_url,
+                    prompt,
+                    prompt_len,
+                    output_len,
+                    args.best_of,
+                    args.use_beam_search,
+                    args.top_k,
+                    tokenizer,
+                    args.sax_model,
+                    model,
+                    args.request_timeout,
+                )
+            )
+
+    # Benchmark Phase: schedule tasks until the benchmark duration is reached.
+    benchmark_start_time = time.time()
+    tasks: List[asyncio.Task] = []
+    prompts_sent: int = 0
+
+    async for request in generate_next_request(input_requests, args.request_rate):
+        # Stop generating new tasks if the benchmark duration or prompt limit is reached.
+        if time.time() - benchmark_start_time >= args.benchmark_duration :
+            break
+        if prompts_sent >= args.num_prompts:
+            break
+        prompt, prompt_len, output_len = request
+        if args.stream_request:
+            task = asyncio.create_task(
+                send_stream_request(
+                    args.backend,
+                    base_model,
+                    api_url,
+                    metrics_url,
+                    prompt,
+                    prompt_len,
+                    output_len,
+                    args.best_of,
+                    args.use_beam_search,
+                    args.top_k,
+                    tokenizer,
+                    args.sax_model,
+                    model,
+                    args.request_timeout,
+                )
+            )
+        else:
+            task = asyncio.create_task(
+                send_request(
+                    args.backend,
+                    base_model,
+                    api_url,
+                    metrics_url,
+                    prompt,
+                    prompt_len,
+                    output_len,
+                    args.best_of,
+                    args.use_beam_search,
+                    args.top_k,
+                    tokenizer,
+                    args.sax_model,
+                    model,
+                    args.request_timeout,
+                )
+            )
+        tasks.append(task)
+        prompts_sent += 1
+
+    # Wait only for the remaining time of the benchmark duration.
+    elapsed = time.time() - benchmark_start_time
+    remaining_time = max(0, args.benchmark_duration - elapsed)
+    done, pending = await asyncio.wait(tasks, timeout=remaining_time)
+    benchmark_duration_actual = time.time() - benchmark_start_time
+    
+    # Gather results from tasks that completed in time.
+    results = [task.result() for task in done if not task.cancelled()]
+
+    # Cancel any tasks that didn't finish in time.
+    for task in pending:
+        task.cancel()
+
+    # Process the gathered results.
+    combined_latencies = []
+    combined_ttfts = []
+    combined_errors = init_errors_map()
+    for latency, ttft, errors in results:
+        if latency:
+            combined_latencies.append(latency)
+        if ttft:
+            combined_ttfts.append(ttft)
+        if errors:
+            for err, count in errors.items():
+                combined_errors[err] += count
+
+    
+    print_and_save_result(args, benchmark_duration_actual, prompts_sent, model, combined_latencies, combined_ttfts, combined_errors)
+    
+    return combined_latencies, combined_ttfts, combined_errors
+
 
 def save_json_results(args: argparse.Namespace, benchmark_result, server_metrics, model, errors):
   # Setup
@@ -617,7 +686,19 @@ def metrics_to_scrape(backend: str) -> List[str]:
   # It must be populated on the outputs 'metrics' field as 'key':'stats'
   # If a value is specified for a given key, it will be populated on the outputs `summary_stats.stats` field as 'value':'stats' as well.
   if backend == "vllm":
-    return ["vllm:gpu_cache_usage_perc", "vllm:num_requests_waiting"]
+        return [
+      "vllm:gpu_cache_usage_perc", 
+      "vllm:num_requests_waiting",
+      "vllm:num_requests_running",
+      "vllm:num_requests_swapped",
+      "vllm:time_to_first_token_seconds",
+      "vllm:time_per_output_token_seconds",
+      "vllm:request_queue_time_seconds",
+      "vllm:request_inference_time_seconds",
+      "vllm:request_prompt_tokens",
+      "vllm:request_generation_tokens",
+      "vllm:iteration_tokens_total",
+    ]
   elif backend == "jetstream":
     return [
       "jetstream_slots_used_percentage",
@@ -837,7 +918,7 @@ async def main(args: argparse.Namespace):
   args.start_datetime = datetime.fromtimestamp(benchmark_start_time)
   
   results = await asyncio.gather(
-            *[benchmark(args, api_url, metric_url, tokenizer, model) for model in models]
+            *[benchmark(args, api_url, metric_url, tokenizer, model, ) for model in models]
         )
   
   # Summarize results
@@ -1006,6 +1087,22 @@ if __name__ == "__main__":
       "--save-json-results",
       action="store_true",
       help="Whether to save benchmark results to a json file.",
+  )
+  parser.add_argument(
+      "--benchmark-duration",
+      type=float,
+      default=float("100"),
+      help=(
+          "time in seconds to run the benchmark."
+      ),
+  )
+  parser.add_argument(
+      "--warmup-duration",
+      type=float,
+      default=float("10"),
+      help=(
+          "time in seconds to run the warmup."
+      ),
   )
   parser.add_argument(
     "--output-bucket",
